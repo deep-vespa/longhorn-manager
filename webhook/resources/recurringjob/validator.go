@@ -13,6 +13,10 @@ import (
 	werror "github.com/longhorn/longhorn-manager/webhook/error"
 )
 
+const (
+	RecurringJobErrRetainValueFmt = "retain value should be less than or equal to %v"
+)
+
 type recurringJobValidator struct {
 	admission.DefaultValidator
 	ds *datastore.DataStore
@@ -43,8 +47,8 @@ func (r *recurringJobValidator) Create(request *admission.Request, newObj runtim
 		return werror.NewInvalidError(fmt.Sprintf("invalid name %v", recurringJob.Name), "")
 	}
 
-	if recurringJob.Spec.Retain < 1 || recurringJob.Spec.Retain > datastore.MaxRecurringJobRetain {
-		return werror.NewInvalidError(fmt.Sprintf("retain in body should be less than or equal to %v", datastore.MaxRecurringJobRetain), "")
+	if recurringJob.Spec.Retain > datastore.MaxRecurringJobRetain {
+		return werror.NewInvalidError(fmt.Sprintf(RecurringJobErrRetainValueFmt, datastore.MaxRecurringJobRetain), "")
 	}
 
 	jobs := []longhorn.RecurringJobSpec{
@@ -69,8 +73,8 @@ func (r *recurringJobValidator) Create(request *admission.Request, newObj runtim
 func (r *recurringJobValidator) Update(request *admission.Request, oldObj runtime.Object, newObj runtime.Object) error {
 	newRecurringJob := newObj.(*longhorn.RecurringJob)
 
-	if newRecurringJob.Spec.Retain < 1 || newRecurringJob.Spec.Retain > datastore.MaxRecurringJobRetain {
-		return werror.NewInvalidError(fmt.Sprintf("retain in body should be less than or equal to %v", datastore.MaxRecurringJobRetain), "")
+	if newRecurringJob.Spec.Retain > datastore.MaxRecurringJobRetain {
+		return werror.NewInvalidError(fmt.Sprintf(RecurringJobErrRetainValueFmt, datastore.MaxRecurringJobRetain), "")
 	}
 
 	jobs := []longhorn.RecurringJobSpec{

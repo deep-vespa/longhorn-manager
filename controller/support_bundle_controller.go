@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -319,6 +320,13 @@ func (c *SupportBundleController) reconcile(name string) (err error) {
 
 	switch supportBundle.Status.State {
 	case longhorn.SupportBundleStateNone:
+		if err = c.replaceReadySupportBundlesWith(supportBundle); err != nil {
+			return c.updateSupportBundleRecord(record,
+				supportBundleRecordError, longhorn.SupportBundleStateError,
+				constant.EventReasonFailedStarting, err.Error(),
+			)
+		}
+
 		var supportBundleManagerImage string
 		supportBundleManagerImage, err = c.ds.GetSettingValueExisted(types.SettingNameSupportBundleManagerImage)
 		if err != nil {
@@ -423,10 +431,7 @@ func (c *SupportBundleController) reconcile(name string) (err error) {
 			if otherSupportBundle.Name == supportBundle.Name {
 				continue
 			}
-			if otherSupportBundle.Status.State == longhorn.SupportBundleStatePurging {
-				continue
-			}
-			if otherSupportBundle.Status.State == longhorn.SupportBundleStateDeleting {
+			if types.IsSupportBundleControllerDeleting(supportBundle) {
 				continue
 			}
 			if otherSupportBundle.Status.State != longhorn.SupportBundleStateError {
@@ -444,8 +449,37 @@ func (c *SupportBundleController) reconcile(name string) (err error) {
 		if err != nil && !apierrors.IsNotFound(err) {
 			log.WithError(err).Warn("Failed to purge SupportBundle")
 		}
+	case longhorn.SupportBundleStateReplaced:
+		err = c.ds.DeleteSupportBundle(supportBundle.Name)
+		if err != nil && !apierrors.IsNotFound(err) {
+			log.WithError(err).Warn("Failed to replace SupportBundle")
+		}
 	}
 
+	return nil
+}
+
+func (c *SupportBundleController) replaceReadySupportBundlesWith(supportBundle *longhorn.SupportBundle) error {
+	supportBundles, err := c.ds.ListSupportBundles()
+	if err != nil {
+		return err
+	}
+
+	for _, otherSupportBundle := range supportBundles {
+		if otherSupportBundle.Name == supportBundle.Name {
+			continue
+		}
+
+		if otherSupportBundle.Status.State != longhorn.SupportBundleStateReady {
+			continue
+		}
+
+		otherSupportBundle.Status.State = longhorn.SupportBundleStateReplaced
+		_, err = c.ds.UpdateSupportBundleStatus(otherSupportBundle)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return errors.Wrapf(err, "failed to update SupportBundle %v to state %v", otherSupportBundle.Name, longhorn.SupportBundleStateReplaced)
+		}
+	}
 	return nil
 }
 
@@ -586,11 +620,6 @@ func (c *SupportBundleController) createSupportBundleManagerDeployment(supportBu
 		return nil, err
 	}
 
-	tolerations, err := c.ds.GetSettingTaintToleration()
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to get taint toleration setting before creating support bundle manager deployment")
-	}
-
 	imagePullPolicy, err := c.ds.GetSettingImagePullPolicy()
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get system pods image pull policy before creating support bundle manager deployment")
@@ -608,13 +637,25 @@ func (c *SupportBundleController) createSupportBundleManagerDeployment(supportBu
 	}
 	registrySecret := registrySecretSetting.Value
 
-	newSupportBundleManager := c.newSupportBundleManager(supportBundle, nodeSelector, tolerations, imagePullPolicy, priorityClass, registrySecret)
+	newSupportBundleManager, err := c.newSupportBundleManager(supportBundle, nodeSelector, imagePullPolicy, priorityClass, registrySecret)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to create new support bundle manager")
+	}
 	return c.ds.CreateDeployment(newSupportBundleManager)
 }
 
-func (c *SupportBundleController) newSupportBundleManager(supportBundle *longhorn.SupportBundle,
-	nodeSelector map[string]string, tolerations []corev1.Toleration,
-	imagePullPolicy corev1.PullPolicy, priorityClass, registrySecret string) *appsv1.Deployment {
+func (c *SupportBundleController) newSupportBundleManager(supportBundle *longhorn.SupportBundle, nodeSelector map[string]string,
+	imagePullPolicy corev1.PullPolicy, priorityClass, registrySecret string) (*appsv1.Deployment, error) {
+
+	tolerationSetting, err := c.ds.GetSetting(types.SettingNameTaintToleration)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get %v setting", types.SettingNameTaintToleration)
+	}
+	tolerations, err := types.UnmarshalTolerations(tolerationSetting.Value)
+	if err != nil {
+		return nil, err
+	}
+
 	supportBundleManagerName := GetSupportBundleManagerName(supportBundle)
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -679,6 +720,22 @@ func (c *SupportBundleController) newSupportBundleManager(supportBundle *longhor
 									Name:  "SUPPORT_BUNDLE_IMAGE_PULL_POLICY",
 									Value: string(api.PullAlways),
 								},
+								{
+									Name:  "SUPPORT_BUNDLE_REGISTRY_SECRET",
+									Value: string(registrySecret),
+								},
+								{
+									Name:  "SUPPORT_BUNDLE_COLLECTOR",
+									Value: "longhorn",
+								},
+								{
+									Name:  "SUPPORT_BUNDLE_NODE_SELECTOR",
+									Value: c.getNodeSelectorString(nodeSelector),
+								},
+								{
+									Name:  "SUPPORT_BUNDLE_TAINT_TOLERATION",
+									Value: c.getTaintTolerationString(tolerationSetting),
+								},
 							},
 							Ports: []corev1.ContainerPort{
 								{
@@ -700,5 +757,20 @@ func (c *SupportBundleController) newSupportBundleManager(supportBundle *longhor
 		}
 	}
 
-	return deployment
+	return deployment, nil
+}
+
+func (c *SupportBundleController) getNodeSelectorString(nodeSelector map[string]string) string {
+	list := make([]string, 0, len(nodeSelector))
+	for k, v := range nodeSelector {
+		list = append(list, k+"="+v)
+	}
+	return strings.Join(list, ",")
+}
+
+func (c *SupportBundleController) getTaintTolerationString(setting *longhorn.Setting) string {
+	if setting == nil {
+		return ""
+	}
+	return strings.ReplaceAll(setting.Value, ";", ",")
 }

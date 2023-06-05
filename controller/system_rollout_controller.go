@@ -2,7 +2,6 @@ package controller
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -620,7 +619,7 @@ func (c *SystemRolloutController) cacheLonghornResources() error {
 func (c *SystemRolloutController) cacheResourcesFromDirectory(name string, scheme *runtime.Scheme) error {
 	codecs := serializer.NewCodecFactory(scheme)
 
-	files, err := ioutil.ReadDir(name)
+	files, err := os.ReadDir(name)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
 			return nil
@@ -950,6 +949,11 @@ func (c *SystemRolloutController) restoreConfigMaps() (err error) {
 
 	for _, restore := range c.configMapList.Items {
 		log := c.logger.WithField(types.KubernetesKindConfigMap, restore.Name)
+
+		if restore.Name == types.DefaultDefaultSettingConfigMapName {
+			log.Infof(SystemRolloutMsgIgnoreItemFmt, types.DefaultDefaultSettingConfigMapName)
+			continue
+		}
 
 		exist, err := c.ds.GetConfigMapRO(restore.Namespace, restore.Name)
 		if err != nil {
@@ -1717,6 +1721,8 @@ func (c *SystemRolloutController) restoreServiceAccounts() (err error) {
 var systemRolloutIgnoredSettings = [...]string{
 	string(types.SettingNameConcurrentBackupRestorePerNodeLimit),
 	string(types.SettingNameConcurrentReplicaRebuildPerNodeLimit),
+	string(types.SettingNameBackupTarget),
+	string(types.SettingNameBackupTargetCredentialSecret),
 }
 
 func isSystemRolloutIgnoredSetting(name string) bool {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
 	. "github.com/longhorn/backupstore/logging"
@@ -80,7 +81,7 @@ type DeltaBlockBackupOperations interface {
 	OpenSnapshot(id, volumeID string) error
 	ReadSnapshot(id, volumeID string, start int64, data []byte) error
 	CloseSnapshot(id, volumeID string) error
-	UpdateBackupStatus(id, volumeID string, backupProgress int, backupURL string, err string) error
+	UpdateBackupStatus(id, volumeID string, backupState string, backupProgress int, backupURL string, err string) error
 }
 
 type DeltaRestoreOperations interface {
@@ -101,16 +102,23 @@ const (
 
 func CreateDeltaBlockBackup(config *DeltaBackupConfig) (string, bool, error) {
 	if config == nil {
-		return "", false, fmt.Errorf("Invalid empty config for backup")
+		return "", false, fmt.Errorf("BUG: invalid empty config for backup")
 	}
-
 	volume := config.Volume
 	snapshot := config.Snapshot
 	destURL := config.DestURL
 	deltaOps := config.DeltaOps
 	if deltaOps == nil {
-		return "", false, fmt.Errorf("Missing DeltaBlockBackupOperations")
+		return "", false, fmt.Errorf("BUG: missing DeltaBlockBackupOperations")
 	}
+
+	var err error
+
+	defer func() {
+		if err != nil {
+			deltaOps.UpdateBackupStatus(snapshot.Name, volume.Name, string(ProgressStateError), 0, "", err.Error())
+		}
+	}()
 
 	bsDriver, err := GetBackupStoreDriver(destURL)
 	if err != nil {
@@ -182,6 +190,7 @@ func CreateDeltaBlockBackup(config *DeltaBackupConfig) (string, bool, error) {
 		LogFieldSnapshot:     snapshot.Name,
 		LogFieldLastSnapshot: backupRequest.getLastSnapshotName(),
 	}).Debug("Generating snapshot changed blocks config")
+
 	delta, err := deltaOps.CompareSnapshot(snapshot.Name, backupRequest.getLastSnapshotName(), volume.Name)
 	if err != nil {
 		deltaOps.CloseSnapshot(snapshot.Name, volume.Name)
@@ -229,9 +238,10 @@ func CreateDeltaBlockBackup(config *DeltaBackupConfig) (string, bool, error) {
 		defer lock.Unlock()
 
 		if progress, backup, err := performBackup(config, delta, deltaBackup, backupRequest.lastBackup, bsDriver); err != nil {
-			deltaOps.UpdateBackupStatus(snapshot.Name, volume.Name, progress, "", err.Error())
+			logrus.WithError(err).Errorf("Failed to perform backup for volume %v snapshot %v", volume.Name, snapshot.Name)
+			deltaOps.UpdateBackupStatus(snapshot.Name, volume.Name, string(ProgressStateInProgress), progress, "", err.Error())
 		} else {
-			deltaOps.UpdateBackupStatus(snapshot.Name, volume.Name, progress, backup, "")
+			deltaOps.UpdateBackupStatus(snapshot.Name, volume.Name, string(ProgressStateInProgress), progress, backup, "")
 		}
 	}()
 	return deltaBackup.Name, backupRequest.isIncrementalBackup(), nil
@@ -240,7 +250,6 @@ func CreateDeltaBlockBackup(config *DeltaBackupConfig) (string, bool, error) {
 // performBackup if lastBackup is present we will do an incremental backup
 func performBackup(config *DeltaBackupConfig, delta *Mappings, deltaBackup *Backup, lastBackup *Backup,
 	bsDriver BackupStoreDriver) (int, string, error) {
-
 	// create an in progress backup config file
 	if err := saveBackup(&Backup{Name: deltaBackup.Name, VolumeName: deltaBackup.VolumeName,
 		CreatedTime: ""}, bsDriver); err != nil {
@@ -299,7 +308,7 @@ func performBackup(config *DeltaBackupConfig, delta *Mappings, deltaBackup *Back
 			deltaBackup.Blocks = append(deltaBackup.Blocks, blockMapping)
 		}
 		progress = int((float64(m+1) / float64(mCounts)) * PROGRESS_PERCENTAGE_BACKUP_SNAPSHOT)
-		deltaOps.UpdateBackupStatus(snapshot.Name, volume.Name, progress, "", "")
+		deltaOps.UpdateBackupStatus(snapshot.Name, volume.Name, string(ProgressStateInProgress), progress, "", "")
 	}
 
 	log.WithFields(logrus.Fields{
@@ -426,13 +435,13 @@ func RestoreDeltaBlockBackup(config *DeltaRestoreConfig) error {
 	}
 
 	if vol.Size == 0 || vol.Size%DEFAULT_BLOCK_SIZE != 0 {
-		return fmt.Errorf("Read invalid volume size %v", vol.Size)
+		return fmt.Errorf("read invalid volume size %v", vol.Size)
 	}
 
 	if _, err := os.Stat(volDevName); err == nil {
 		logrus.Warnf("File %s for the restore exists, will remove and re-create it", volDevName)
 		if err := os.Remove(volDevName); err != nil {
-			return fmt.Errorf("failed to clean up the existing file %v before restore: %v", volDevName, err)
+			return errors.Wrapf(err, "failed to clean up the existing file %v before restore", volDevName)
 		}
 	}
 
@@ -579,7 +588,7 @@ func RestoreDeltaBlockBackupIncrementally(config *DeltaRestoreConfig) error {
 	if _, err := os.Stat(volDevName); err == nil {
 		logrus.Warnf("File %s for the incremental restore exists, will remove and re-create it", volDevName)
 		if err := os.Remove(volDevName); err != nil {
-			return fmt.Errorf("failed to clean up the existing file %v before incremental restore: %v", volDevName, err)
+			return errors.Wrapf(err, "failed to clean up the existing file %v before incremental restore", volDevName)
 		}
 	}
 
@@ -721,18 +730,14 @@ func DeleteBackupVolume(volumeName string, destURL string) error {
 		return err
 	}
 	defer lock.Unlock()
-	if err := removeVolume(volumeName, bsDriver); err != nil {
-		return err
-	}
-	return nil
+	return removeVolume(volumeName, bsDriver)
 }
 
 func checkBlockReferenceCount(blockInfos map[string]*BlockInfo, backup *Backup, volumeName string, driver BackupStoreDriver) {
 	for _, block := range backup.Blocks {
 		info, known := blockInfos[block.BlockChecksum]
 		if !known {
-			log.Errorf("backup %v refers to unknown block %v",
-				backup.Name, block.BlockChecksum)
+			log.Errorf("Backup %v refers to unknown block %v", backup.Name, block.BlockChecksum)
 			info = &BlockInfo{checksum: block.BlockChecksum}
 			blockInfos[block.BlockChecksum] = info
 		}
@@ -750,12 +755,12 @@ func getLatestBackup(backup *Backup, lastBackup *Backup) error {
 
 	backupTime, err := time.Parse(time.RFC3339, backup.SnapshotCreatedAt)
 	if err != nil {
-		return fmt.Errorf("Cannot parse backup %v time %v due to %v", backup.Name, backup.SnapshotCreatedAt, err)
+		return errors.Wrapf(err, "cannot parse backup %v time %v", backup.Name, backup.SnapshotCreatedAt)
 	}
 
 	lastBackupTime, err := time.Parse(time.RFC3339, lastBackup.SnapshotCreatedAt)
 	if err != nil {
-		return fmt.Errorf("Cannot parse last backup %v time %v due to %v", lastBackup.Name, lastBackup.SnapshotCreatedAt, err)
+		return errors.Wrapf(err, "cannot parse last backup %v time %v", lastBackup.Name, lastBackup.SnapshotCreatedAt)
 	}
 
 	if backupTime.After(lastBackupTime) {
@@ -792,7 +797,7 @@ func DeleteDeltaBlockBackup(backupURL string) error {
 	// If we fail to load the backup we still want to proceed with the deletion of the backup file
 	backupToBeDeleted, err := loadBackup(backupName, volumeName, bsDriver)
 	if err != nil {
-		log.WithError(err).Warn("failed to load to be deleted backup")
+		log.WithError(err).Warn("Failed to load to be deleted backup")
 		backupToBeDeleted = &Backup{
 			Name:       backupName,
 			VolumeName: volumeName,
@@ -807,7 +812,7 @@ func DeleteDeltaBlockBackup(backupURL string) error {
 
 	v, err := loadVolume(volumeName, bsDriver)
 	if err != nil {
-		return fmt.Errorf("Cannot find volume in backupstore due to: %v", err)
+		return errors.Wrap(err, "cannot find volume in backupstore")
 	}
 	updateLastBackup := false
 	if backupToBeDeleted.Name == v.LastBackupName {
@@ -820,7 +825,7 @@ func DeleteDeltaBlockBackup(backupURL string) error {
 	deleteBlocks := true
 	backupNames, err := getBackupNamesForVolume(volumeName, bsDriver)
 	if err != nil {
-		log.WithError(err).Warn("failed to load backup names, skip block deletion")
+		log.WithError(err).Warn("Failed to load backup names, skip block deletion")
 		deleteBlocks = false
 	}
 
@@ -842,7 +847,7 @@ func DeleteDeltaBlockBackup(backupURL string) error {
 		log := log.WithField("backup", name)
 		backup, err := loadBackup(name, volumeName, bsDriver)
 		if err != nil {
-			log.WithError(err).Warn("failed to load backup, skip block deletion")
+			log.WithError(err).Warn("Failed to load backup, skip block deletion")
 			deleteBlocks = false
 			break
 		}
@@ -861,7 +866,7 @@ func DeleteDeltaBlockBackup(backupURL string) error {
 		if updateLastBackup {
 			err := getLatestBackup(backup, lastBackup)
 			if err != nil {
-				log.WithError(err).Warn("failed to find last backup, skip block deletion")
+				log.WithError(err).Warn("Failed to find last backup, skip block deletion")
 				deleteBlocks = false
 				break
 			}
@@ -904,7 +909,7 @@ func cleanupBlocks(blockMap map[string]*BlockInfo, volume string, driver BackupS
 				deletionFailures = append(deletionFailures, blk.checksum)
 				continue
 			}
-			log.Debugf("deleted block %v for volume %v", blk.checksum, volume)
+			log.Debugf("Deleted block %v for volume %v", blk.checksum, volume)
 			deletedBlockCount++
 		} else if isBlockReferenced(blk) && isBlockPresent(blk) {
 			activeBlockCount++

@@ -25,7 +25,6 @@ import (
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/kubernetes/pkg/controller"
 
-	"github.com/longhorn/backupstore"
 	etypes "github.com/longhorn/longhorn-engine/pkg/types"
 	imapi "github.com/longhorn/longhorn-instance-manager/pkg/api"
 	imclient "github.com/longhorn/longhorn-instance-manager/pkg/client"
@@ -40,8 +39,10 @@ import (
 )
 
 const (
-	unknownReplicaPrefix    = "UNKNOWN-"
-	restoreGetLockFailedMsg = "error initiating full backup restore: failed lock"
+	unknownReplicaPrefix            = "UNKNOWN-"
+	restoreGetLockFailedMsg         = "error initiating full backup restore: failed lock"
+	restoreAlreadyInProgressMsg     = "already in progress"
+	restoreAlreadyRestoredBackupMsg = "already restored backup"
 )
 
 var (
@@ -315,7 +316,7 @@ func (ec *EngineController) syncEngine(key string) (err error) {
 
 	syncReplicaAddressMap := false
 	if len(engine.Spec.UpgradedReplicaAddressMap) != 0 && engine.Status.CurrentImage != engine.Spec.EngineImage {
-		if err := ec.Upgrade(engine); err != nil {
+		if err := ec.Upgrade(engine, log); err != nil {
 			// Engine live upgrade failure shouldn't block the following engine state update.
 			log.WithError(err).Error("failed to run engine live upgrade")
 			// Sync replica address map as usual when the upgrade fails.
@@ -325,7 +326,7 @@ func (ec *EngineController) syncEngine(key string) (err error) {
 		syncReplicaAddressMap = true
 	}
 	if syncReplicaAddressMap && !reflect.DeepEqual(engine.Status.CurrentReplicaAddressMap, engine.Spec.ReplicaAddressMap) {
-		log.Debug("Updating engine current replica address map")
+		log.Infof("Updating engine current replica address map to %+v", engine.Spec.ReplicaAddressMap)
 		engine.Status.CurrentReplicaAddressMap = engine.Spec.ReplicaAddressMap
 		// Make sure the CurrentReplicaAddressMap persist in the etcd before continue
 		return nil
@@ -463,19 +464,19 @@ func (ec *EngineController) CreateInstance(obj interface{}) (*longhorn.InstanceP
 	return c.EngineProcessCreate(e, frontend, engineReplicaTimeout, fileSyncHTTPClientTimeout, v.Spec.DataLocality, engineCLIAPIVersion)
 }
 
-func (ec *EngineController) DeleteInstance(obj interface{}) error {
+func (ec *EngineController) DeleteInstance(obj interface{}) (err error) {
 	e, ok := obj.(*longhorn.Engine)
 	if !ok {
 		return fmt.Errorf("BUG: invalid object for engine process deletion: %v", obj)
 	}
 	log := getLoggerForEngine(ec.logger, e)
 
-	if err := ec.deleteInstanceWithCLIAPIVersionOne(e); err != nil {
+	err = ec.deleteInstanceWithCLIAPIVersionOne(e)
+	if err != nil {
 		return err
 	}
 
 	var im *longhorn.InstanceManager
-	var err error
 	// Not assigned or not updated, try best to delete
 	if e.Status.InstanceManagerName == "" {
 		if e.Spec.NodeID == "" {
@@ -500,22 +501,69 @@ func (ec *EngineController) DeleteInstance(obj interface{}) error {
 		}
 	}
 
-	if im.Status.CurrentState != longhorn.InstanceManagerStateRunning {
-		return nil
+	v, err := ec.ds.GetVolumeRO(e.Spec.VolumeName)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
 	}
+
+	isRWXVolume := false
+	if v != nil && v.Spec.AccessMode == longhorn.AccessModeReadWriteMany && !v.Spec.Migratable {
+		isRWXVolume = true
+	}
+
+	// For a RWX volume, the node down, for example, caused by kubelet restart, leads to share-manager pod deletion/recreation
+	// and volume detachment/attachment.
+	// Then, the newly created share-manager pod blindly mounts the longhorn volume inside /dev/longhorn/<pvc-name> and exports it.
+	// To avoid mounting a dead and orphaned volume, try to clean up the engine process as well as the orphaned iscsi device
+	// regardless of the instance-manager status.
+	if !isRWXVolume {
+		if im.Status.CurrentState != longhorn.InstanceManagerStateRunning {
+			logrus.Infof("Skip deleting engine %v since instance manager is in %v state", e.Name, im.Status.CurrentState)
+			return nil
+		}
+	}
+
+	logrus.Infof("Deleting engine instance %v", e.Name)
+
+	defer func() {
+		if err != nil {
+			logrus.WithError(err).Warnf("Failed to delete engine %v for volume %v", e.Name, v.Name)
+		}
+		if isRWXVolume && im.Status.CurrentState != longhorn.InstanceManagerStateRunning {
+			// Try the best to delete engine instance.
+			// To prevent that the volume is stuck at detaching state, ignore the error when volume is
+			// a RWX volume and the instance manager is not running.
+			//
+			// If the engine instance of a RWX volume is not deleted successfully:
+			// If a RWX volume is on node A and the network of this node is partitioned,
+			// the owner of the share manager (SM) is transferred to node B. The engine instance and
+			// the block device (/dev/longhorn/pvc-xxx) on the node A become orphaned.
+			// If the network of the node A gets back to normal, the SM can be shifted back to node A.
+			// After shifting to node A, the first reattachment fail due to the IO error resulting from the
+			// orphaned engine instance and block device. Then, the detachment will trigger the teardown of the
+			// problematic engine process and block device. The next reattachment then will succeed.
+			logrus.Warnf("Ignored the failure of deleting engine %v for volume %v", e.Name, v.Name)
+			err = nil
+		}
+	}()
 
 	// For the engine process in instance manager v0.7.0, we need to use the cmdline to delete the process
 	// and stop the iscsi
 	if im.Status.APIVersion == engineapi.IncompatibleInstanceManagerAPIVersion {
 		url := imutil.GetURL(im.Status.IP, engineapi.InstanceManagerDefaultPort)
 		args := []string{"--url", url, "engine", "delete", "--name", e.Name}
-		if _, err := util.ExecuteWithoutTimeout([]string{}, engineapi.GetDeprecatedInstanceManagerBinary(e.Status.CurrentImage), args...); err != nil && !types.ErrorIsNotFound(err) {
+
+		_, err = util.ExecuteWithoutTimeout([]string{}, engineapi.GetDeprecatedInstanceManagerBinary(e.Status.CurrentImage), args...)
+		if err != nil && !types.ErrorIsNotFound(err) {
 			return err
 		}
 
 		// Directly remove the instance from the map. Best effort.
 		delete(im.Status.Instances, e.Name)
-		if _, err := ec.ds.UpdateInstanceManagerStatus(im); err != nil {
+		_, err = ec.ds.UpdateInstanceManagerStatus(im)
+		if err != nil {
 			return err
 		}
 		return nil
@@ -526,7 +574,9 @@ func (ec *EngineController) DeleteInstance(obj interface{}) error {
 		return err
 	}
 	defer c.Close()
-	if err := c.ProcessDelete(e.Name); err != nil && !types.ErrorIsNotFound(err) {
+
+	err = c.ProcessDelete(e.Name)
+	if err != nil && !types.ErrorIsNotFound(err) {
 		return err
 	}
 
@@ -1007,7 +1057,6 @@ func (m *EngineMonitor) refresh(engine *longhorn.Engine) error {
 	if err != nil {
 		return err
 	}
-
 	// Incremental restoration will implicitly expand the DR volume once the backup volume is expanded
 	if needRestore {
 		if m.restoreBackoff.IsInBackOffSinceUpdate(engine.Name, time.Now()) {
@@ -1101,6 +1150,16 @@ func (m *EngineMonitor) acquireRestoringCounter(acquire bool) error {
 }
 
 func (ec *EngineController) syncSnapshotCRs(engine *longhorn.Engine) error {
+	log := ec.logger.WithField("engine", engine.Name)
+
+	vol, err := ec.ds.GetVolumeRO(engine.Spec.VolumeName)
+	if err != nil {
+		return err
+	}
+	if vol.Spec.MigrationNodeID != "" {
+		return nil
+	}
+
 	snapshotCRs, err := ec.ds.ListVolumeSnapshotsRO(engine.Spec.VolumeName)
 	if err != nil {
 		return err
@@ -1113,7 +1172,7 @@ func (ec *EngineController) syncSnapshotCRs(engine *longhorn.Engine) error {
 		requestCreateNewSnapshot := snapCR.Spec.CreateSnapshot
 		alreadyCreatedBefore := snapCR.Status.CreationTime != ""
 		if _, ok := engine.Status.Snapshots[snapName]; !ok && (!requestCreateNewSnapshot || alreadyCreatedBefore) && snapCR.DeletionTimestamp == nil {
-			ec.logger.Infof("Deleting snapshot CR for the snapshot %v", snapName)
+			log.Infof("Deleting snapshot CR for the snapshot %v", snapName)
 			if err := ec.ds.DeleteSnapshot(snapName); err != nil && !apierrors.IsNotFound(err) {
 				utilruntime.HandleError(fmt.Errorf("syncSnapshotCRs: failed to delete snapshot CR %v: %v", snapCR.Name, err))
 			}
@@ -1142,7 +1201,7 @@ func (ec *EngineController) syncSnapshotCRs(engine *longhorn.Engine) error {
 					CreateSnapshot: false,
 				},
 			}
-			ec.logger.Infof("Creating snapshot CR for the snapshot %v", snapName)
+			log.Infof("Creating snapshot CR for the snapshot %v", snapName)
 			if _, err := ec.ds.CreateSnapshot(snapCR); err != nil && !apierrors.IsAlreadyExists(err) {
 				utilruntime.HandleError(fmt.Errorf("syncSnapshotCRs: failed to create snapshot CR %v: %v", snapCR.Name, err))
 			}
@@ -1197,7 +1256,6 @@ func preRestoreCheckAndSync(log logrus.FieldLogger, engine *longhorn.Engine,
 	}
 	if cliAPIVersion < engineapi.CLIVersionFour {
 		isRestoring, isConsensual := syncWithRestoreStatusForCompatibleEngine(log, engine, rsMap)
-
 		if isRestoring || !isConsensual || engine.Spec.RequestedBackupRestore == "" || engine.Spec.RequestedBackupRestore == engine.Status.LastRestoredBackup {
 			return false, nil
 		}
@@ -1353,13 +1411,12 @@ func checkSizeBeforeRestoration(log logrus.FieldLogger, engine *longhorn.Engine,
 }
 
 func (m *EngineMonitor) restoreBackup(engine *longhorn.Engine, rsMap map[string]*longhorn.RestoreStatus, cliAPIVersion int, engineClientProxy engineapi.EngineClientProxy) error {
-	// Get default backup target
 	backupTarget, err := m.ds.GetBackupTargetRO(types.DefaultBackupTargetName)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
-		return fmt.Errorf("cannot found the %s backup target", types.DefaultBackupTargetName)
+		return fmt.Errorf("cannot find the backup target %s", types.DefaultBackupTargetName)
 	}
 
 	backupTargetClient, err := newBackupTargetClientFromDefaultEngineImage(m.ds, backupTarget)
@@ -1373,21 +1430,6 @@ func (m *EngineMonitor) restoreBackup(engine *longhorn.Engine, rsMap map[string]
 		"requestedRestoredBackupName": engine.Spec.RequestedBackupRestore,
 		"lastRestoredBackupName":      engine.Status.LastRestoredBackup,
 	})
-
-	// check if backup exists
-	backupURL := backupstore.EncodeBackupURL(engine.Spec.RequestedBackupRestore, engine.Spec.BackupVolume, backupTargetClient.URL)
-	backupInfo, err := backupTargetClient.BackupGet(backupURL, backupTargetClient.Credential)
-	if err != nil {
-		mlog.WithError(err).Error("Failed to inspect backup config")
-		return errors.Wrapf(err, "cannot inspect backup %v config for backup restoration of engine %v", engine.Spec.RequestedBackupRestore, engine.Name)
-	}
-	if backupInfo == nil {
-		mlog.Error("Failed to do backup restoration due to the remote backup not found, so the restoration will be ignored accordingly")
-		for _, status := range rsMap {
-			status.Error = "remote backup not found"
-		}
-		return nil
-	}
 
 	mlog.Info("Preparing to restore backup")
 	if cliAPIVersion < engineapi.CLIVersionFour {
@@ -1428,21 +1470,27 @@ func handleRestoreError(log logrus.FieldLogger, engine *longhorn.Engine, rsMap m
 	}
 
 	for _, re := range taskErr.ReplicaErrors {
-		if status, exists := rsMap[re.Address]; exists {
-			if strings.Contains(re.Error(), restoreGetLockFailedMsg) {
-				// Register the name with a restore backoff entry
-				log.WithError(re).Debugf("Ignored failed locked restore error from replica %v", re.Address)
-				backoff.Next(engine.Name, time.Now())
-				continue
-			} else {
-				backoff.DeleteEntry(engine.Name)
-			}
-			if strings.Contains(re.Error(), "already in progress") || strings.Contains(re.Error(), "already restored backup") {
-				log.WithError(re).Debugf("Ignored restore error from replica %v", re.Address)
-				continue
-			}
-			status.Error = re.Error()
+		status, exists := rsMap[re.Address]
+		if !exists {
+			continue
 		}
+
+		if strings.Contains(re.Error(), restoreGetLockFailedMsg) {
+			log.WithError(re).Debugf("Ignored failed locked restore error from replica %v", re.Address)
+			// Register the name with a restore backoff entry
+			backoff.Next(engine.Name, time.Now())
+			continue
+		}
+
+		backoff.DeleteEntry(engine.Name)
+
+		if strings.Contains(re.Error(), restoreAlreadyInProgressMsg) ||
+			strings.Contains(re.Error(), restoreAlreadyRestoredBackupMsg) {
+			log.WithError(re).Debugf("Ignored restore error from replica %v", re.Address)
+			continue
+		}
+
+		status.Error = re.Error()
 	}
 
 	return nil
@@ -1456,16 +1504,20 @@ func handleRestoreErrorForCompatibleEngine(log logrus.FieldLogger, engine *longh
 	}
 
 	for _, re := range taskErr.ReplicaErrors {
-		if status, exists := rsMap[re.Address]; exists {
-			if strings.Contains(re.Error(), restoreGetLockFailedMsg) {
-				log.WithError(re).Debugf("Ignored failed lock restore error from replica %v", re.Address)
-				// Register the name with a restore backoff entry
-				backoff.Next(engine.Name, time.Now())
-				continue
-			}
-			backoff.DeleteEntry(engine.Name)
-			status.Error = re.Error()
+		status, exists := rsMap[re.Address]
+		if !exists {
+			continue
 		}
+
+		if strings.Contains(re.Error(), restoreGetLockFailedMsg) {
+			log.WithError(re).Debugf("Ignored failed locked restore error from replica %v", re.Address)
+			// Register the name with a restore backoff entry
+			backoff.Next(engine.Name, time.Now())
+			continue
+		}
+
+		backoff.DeleteEntry(engine.Name)
+		status.Error = re.Error()
 	}
 	log.WithError(taskErr).Warnf("Some replicas of the compatible engine failed to start restoring backup %v with last restored backup %v in engine monitor",
 		engine.Spec.RequestedBackupRestore, engine.Status.LastRestoredBackup)
@@ -1627,9 +1679,9 @@ func doesAddressExistInEngine(e *longhorn.Engine, addr string, engineClientProxy
 	return false, nil
 }
 
-func (ec *EngineController) startRebuilding(e *longhorn.Engine, replica, addr string) (err error) {
+func (ec *EngineController) startRebuilding(e *longhorn.Engine, replicaName, addr string) (err error) {
 	defer func() {
-		err = errors.Wrapf(err, "failed to start rebuild for %v of %v", replica, e.Name)
+		err = errors.Wrapf(err, "failed to start rebuild for %v of %v", replicaName, e.Name)
 	}()
 
 	log := ec.logger.WithFields(logrus.Fields{"volume": e.Spec.VolumeName, "engine": e.Name})
@@ -1648,7 +1700,7 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replica, addr st
 	}
 	// replica has already been added to the engine
 	if alreadyExists {
-		ec.logger.Debugf("Replica %v address %v has been added to the engine already", replica, addr)
+		ec.logger.Debugf("Replica %v address %v has been added to the engine already", replicaName, addr)
 		return nil
 	}
 
@@ -1689,7 +1741,7 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replica, addr st
 					"Failed to start snapshot purge for engine %v and volume %v before rebuilding: %v", e.Name, e.Spec.VolumeName, err)
 				return
 			}
-			logrus.Debug("Started snapshot purge before rebuilding, will wait for the purge complete")
+			log.Debug("Started snapshot purge before rebuilding, will wait for the purge complete")
 
 			purgeDone := false
 			endTime := time.Now().Add(time.Duration(purgeWaitIntervalInSecond) * time.Second)
@@ -1730,19 +1782,56 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replica, addr st
 			log.Debug("Finished snapshot purge, will start rebuilding then")
 		}
 
+		// It has been at least 10 seconds (2 * EnginePollInterval) since we were asked to rebuild.
+		// Should we still communicate with addr?
+		// TODO: Remove this check in versions that include a completed longhorn/longhorn#5845.
+		updatedEngine, err := ec.ds.GetEngineRO(e.Name)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				log.Warn("Cannot proceed to rebuild since engine is not found")
+				return
+			}
+			log.WithError(err).Error("Failed to get latest engine spec before rebuilding")
+			return
+		}
+		updatedAddr, ok := updatedEngine.Spec.ReplicaAddressMap[replicaName]
+		if !ok {
+			log.Warnf("Refusing to rebuild since replica %v is no longer in the replicaAddressMap", replicaName)
+			return
+		}
+		if addr != updatedAddr {
+			log.Warnf("Refusing to rebuild since the address for replica %v has been updated from %v to %v", replicaName, addr, updatedAddr)
+			return
+		}
+
+		replica, err := ec.ds.GetReplica(replicaName)
+		if err != nil {
+			log.WithError(err).Errorf("Failed to get replica %v unable to mark failed rebuild", replica)
+			return
+		}
+
+		// check and reset replica rebuild failed condition
+		replica, err = ec.updateReplicaRebuildFailedCondition(replica, "")
+		if err != nil {
+			log.WithError(err).Errorf("Failed to update rebuild status information on replica %v", replicaName)
+			return
+		}
+
 		// start rebuild
 		if e.Spec.RequestedBackupRestore != "" {
 			if e.Spec.NodeID != "" {
 				ec.eventRecorder.Eventf(e, v1.EventTypeNormal, constant.EventReasonRebuilding,
-					"Start rebuilding replica %v with Address %v for restore engine %v and volume %v", replica, addr, e.Name, e.Spec.VolumeName)
+					"Start rebuilding replica %v with Address %v for restore engine %v and volume %v", replicaName, addr, e.Name, e.Spec.VolumeName)
 				err = engineClientProxy.ReplicaAdd(e, replicaURL, true, fastReplicaRebuild, fileSyncHTTPClientTimeout)
 			}
 		} else {
 			ec.eventRecorder.Eventf(e, v1.EventTypeNormal, constant.EventReasonRebuilding,
-				"Start rebuilding replica %v with Address %v for normal engine %v and volume %v", replica, addr, e.Name, e.Spec.VolumeName)
+				"Start rebuilding replica %v with Address %v for normal engine %v and volume %v", replicaName, addr, e.Name, e.Spec.VolumeName)
 			err = engineClientProxy.ReplicaAdd(e, replicaURL, false, fastReplicaRebuild, fileSyncHTTPClientTimeout)
 		}
 		if err != nil {
+			replicaRebuildErrMsg := err.Error()
+
 			log.WithError(err).Errorf("Failed rebuilding of replica %v", addr)
 			ec.eventRecorder.Eventf(e, v1.EventTypeWarning, constant.EventReasonFailedRebuilding, "Failed rebuilding replica with Address %v: %v", addr, err)
 			// we've sent out event to notify user. we don't want to
@@ -1754,7 +1843,7 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replica, addr st
 				log.WithError(err).Errorf("Failed to remove rebuilding replica %v", addr)
 				ec.eventRecorder.Eventf(e, v1.EventTypeWarning, constant.EventReasonFailedDeleting,
 					"Failed to remove rebuilding replica %v with address %v for engine %v and volume %v due to rebuilding failure: %v",
-					replica, addr, e.Name, e.Spec.VolumeName, err)
+					replicaName, addr, e.Name, e.Spec.VolumeName, err)
 			} else {
 				log.Infof("Removed failed rebuilding replica %v", addr)
 			}
@@ -1763,30 +1852,31 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replica, addr st
 			// it is past the Backoff period, we'll try to mark the Replica as Failed and increase the Backoff period
 			// for the next failure.
 			if !ec.backoff.IsInBackOffSinceUpdate(e.Name, time.Now()) {
-				rep, err := ec.ds.GetReplica(replica)
+				replica, err = ec.updateReplicaRebuildFailedCondition(replica, replicaRebuildErrMsg)
 				if err != nil {
-					log.WithError(err).Errorf("Failed to get replica %v unable to mark failed rebuild", replica)
+					log.WithError(err).Errorf("Failed to update rebuild status information on replica %v", replicaName)
 					return
 				}
-				rep.Spec.FailedAt = util.Now()
-				rep.Spec.DesireState = longhorn.InstanceStateStopped
-				if _, err := ec.ds.UpdateReplica(rep); err != nil {
-					log.WithError(err).Errorf("Unable to mark failed rebuild on replica %v", replica)
+
+				replica.Spec.FailedAt = util.Now()
+				replica.Spec.DesireState = longhorn.InstanceStateStopped
+				if _, err := ec.ds.UpdateReplica(replica); err != nil {
+					log.WithError(err).Errorf("Unable to mark failed rebuild on replica %v", replicaName)
 					return
 				}
 				// Now that the Replica can actually be recreated, we can move up the Backoff.
 				ec.backoff.Next(e.Name, time.Now())
 				backoffTime := ec.backoff.Get(e.Name).Seconds()
-				log.Infof("Marked failed rebuild on replica %v, backoff period is now %v seconds", replica, backoffTime)
+				log.Infof("Marked failed rebuild on replica %v, backoff period is now %v seconds", replicaName, backoffTime)
 				return
 			}
-			log.Infof("Engine is still in backoff for replica %v rebuild failure", replica)
+			log.Infof("Engine is still in backoff for replica %v rebuild failure", replicaName)
 			return
 		}
 		// Replica rebuild succeeded, clear Backoff.
 		ec.backoff.DeleteEntry(e.Name)
 		ec.eventRecorder.Eventf(e, v1.EventTypeNormal, constant.EventReasonRebuilt,
-			"Replica %v with Address %v has been rebuilt for volume %v", replica, addr, e.Spec.VolumeName)
+			"Replica %v with Address %v has been rebuilt for volume %v", replicaName, addr, e.Spec.VolumeName)
 
 		// If enabled, call SnapshotPurge to clean up system generated snapshot after rebuilding.
 		if autoCleanupSystemGeneratedSnapshot {
@@ -1796,7 +1886,7 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replica, addr st
 					"Failed to start snapshot purge for engine %v and volume %v after rebuilding: %v", e.Name, e.Spec.VolumeName, err)
 				return
 			}
-			logrus.Debug("Started snapshot purge after rebuilding")
+			log.Debug("Started snapshot purge after rebuilding")
 		}
 	}()
 
@@ -1809,12 +1899,62 @@ func (ec *EngineController) startRebuilding(e *longhorn.Engine, replica, addr st
 	return nil
 }
 
-func (ec *EngineController) Upgrade(e *longhorn.Engine) (err error) {
+// updateReplicaRebuildFailedCondition updates the rebuild failed condition if replica rebuilding failed
+func (ec *EngineController) updateReplicaRebuildFailedCondition(replica *longhorn.Replica, errMsg string) (*longhorn.Replica, error) {
+	replicaRebuildFailedReason, conditionStatus, err := ec.getReplicaRebuildFailedReason(replica.Spec.NodeID, errMsg)
+	if err != nil {
+		return nil, err
+	}
+
+	replica.Status.Conditions = types.SetCondition(
+		replica.Status.Conditions,
+		longhorn.ReplicaConditionTypeRebuildFailed,
+		conditionStatus,
+		replicaRebuildFailedReason,
+		errMsg)
+
+	replica, err = ec.ds.UpdateReplicaStatus(replica)
+
+	return replica, err
+}
+
+func (ec *EngineController) getReplicaRebuildFailedReason(replicaNodeID, errMsg string) (failedReason string, conditionStatus longhorn.ConditionStatus, err error) {
+	failedReason, conditionStatus, isRebuildingFailedByNetwork := getReplicaRebuildFailedReasonFromError(errMsg)
+	if isRebuildingFailedByNetwork {
+		replicaNode, err := ec.ds.GetNodeRO(replicaNodeID)
+		if err != nil {
+			return "", "", err
+		}
+
+		replicaRebuildFailedCondition := types.GetCondition(replicaNode.Status.Conditions, longhorn.NodeConditionTypeReady)
+		switch replicaRebuildFailedCondition.Reason {
+		case longhorn.NodeConditionReasonManagerPodDown, longhorn.NodeConditionReasonKubernetesNodeGone, longhorn.NodeConditionReasonKubernetesNodeNotReady:
+			failedReason = replicaRebuildFailedCondition.Reason
+		}
+	}
+
+	return failedReason, conditionStatus, nil
+}
+
+func getReplicaRebuildFailedReasonFromError(errMsg string) (string, longhorn.ConditionStatus, bool) {
+	switch {
+	case strings.Contains(errMsg, longhorn.ReplicaRebuildFailedCanceledErrorMSG):
+		fallthrough
+	case strings.Contains(errMsg, longhorn.ReplicaRebuildFailedDeadlineExceededErrorMSG):
+		fallthrough
+	case strings.Contains(errMsg, longhorn.ReplicaRebuildFailedUnavailableErrorMSG):
+		return longhorn.ReplicaConditionReasonRebuildFailedDisconnection, longhorn.ConditionStatusTrue, true
+	case errMsg == "":
+		return "", longhorn.ConditionStatusFalse, false
+	default:
+		return longhorn.ReplicaConditionReasonRebuildFailedGeneral, longhorn.ConditionStatusTrue, false
+	}
+}
+
+func (ec *EngineController) Upgrade(e *longhorn.Engine, log *logrus.Entry) (err error) {
 	defer func() {
 		err = errors.Wrapf(err, "cannot live upgrade image for %v", e.Name)
 	}()
-
-	log := ec.logger.WithField("volume", e.Spec.VolumeName)
 
 	engineClientProxy, err := ec.getEngineClientProxy(e, e.Spec.EngineImage)
 	if err != nil {
@@ -1832,7 +1972,7 @@ func (ec *EngineController) Upgrade(e *longhorn.Engine) (err error) {
 	if version.ClientVersion.GitCommit != version.ServerVersion.GitCommit {
 		log.Debugf("Trying to upgrade engine from %v to %v",
 			e.Status.CurrentImage, e.Spec.EngineImage)
-		if err := ec.UpgradeEngineProcess(e); err != nil {
+		if err := ec.UpgradeEngineProcess(e, log); err != nil {
 			return err
 		}
 	}
@@ -1846,7 +1986,7 @@ func (ec *EngineController) Upgrade(e *longhorn.Engine) (err error) {
 	return nil
 }
 
-func (ec *EngineController) UpgradeEngineProcess(e *longhorn.Engine) error {
+func (ec *EngineController) UpgradeEngineProcess(e *longhorn.Engine, log *logrus.Entry) error {
 	frontend := e.Spec.Frontend
 	if e.Spec.DisableFrontend {
 		frontend = longhorn.VolumeFrontendEmpty
@@ -1880,6 +2020,15 @@ func (ec *EngineController) UpgradeEngineProcess(e *longhorn.Engine) error {
 	engineCLIAPIVersion, err := ec.ds.GetEngineImageCLIAPIVersion(e.Spec.EngineImage)
 	if err != nil {
 		return err
+	}
+
+	processBinary, err := c.ProcessGetBinary(e.Name)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get the binary of the current engine process")
+	}
+	if strings.Contains(processBinary, types.GetImageCanonicalName(e.Spec.EngineImage)) {
+		log.Infof("The existing engine process already has the new engine image %v", e.Spec.EngineImage)
+		return nil
 	}
 
 	engineProcess, err := c.EngineProcessUpgrade(e, frontend, engineReplicaTimeout, fileSyncHTTPClientTimeout, v.Spec.DataLocality, engineCLIAPIVersion)

@@ -129,9 +129,7 @@ const (
 	RestoreVolumeRecurringJobDisabled = RestoreVolumeRecurringJobType("disabled")
 )
 
-// VolumeRecurringJobSpec is a deprecated struct.
-// TODO: Should be removed when recurringJobs gets removed from the volume
-//       spec.
+// Deprecated: This field is useless and has been replaced by the RecurringJob CRD
 type VolumeRecurringJobSpec struct {
 	// +optional
 	Name string `json:"name"`

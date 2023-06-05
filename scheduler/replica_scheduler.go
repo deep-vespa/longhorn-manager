@@ -425,8 +425,19 @@ func (rcs *ReplicaScheduler) getDiskWithMostUsableStorage(disks map[string]*Disk
 
 	return diskWithMostUsableStorage
 }
+func filterActiveReplicas(replicas map[string]*longhorn.Replica) map[string]*longhorn.Replica {
+	result := map[string]*longhorn.Replica{}
+	for _, r := range replicas {
+		if r.Spec.Active {
+			result[r.Name] = r
+		}
+	}
+	return result
+}
 
 func (rcs *ReplicaScheduler) CheckAndReuseFailedReplica(replicas map[string]*longhorn.Replica, volume *longhorn.Volume, hardNodeAffinity string) (*longhorn.Replica, error) {
+	replicas = filterActiveReplicas(replicas)
+
 	allNodesInfo, err := rcs.getNodeInfo()
 	if err != nil {
 		return nil, err
@@ -483,11 +494,11 @@ func (rcs *ReplicaScheduler) CheckAndReuseFailedReplica(replicas map[string]*lon
 // If creating new replica immediately is necessary, returns 0.
 // Otherwise, returns the duration that the caller should recheck.
 // A new replica needs to be created when:
-//   1. the volume is a new volume (volume.Status.Robustness is Empty)
-//   2. data locality is required (hardNodeAffinity is not Empty and volume.Status.Robustness is Healthy)
-//   3. replica eviction happens (volume.Status.Robustness is Healthy)
-//   4. there is no potential reusable replica
-//   5. there is potential reusable replica but the replica replenishment wait interval is passed.
+//  1. the volume is a new volume (volume.Status.Robustness is Empty)
+//  2. data locality is required (hardNodeAffinity is not Empty and volume.Status.Robustness is Healthy)
+//  3. replica eviction happens (volume.Status.Robustness is Healthy)
+//  4. there is no potential reusable replica
+//  5. there is potential reusable replica but the replica replenishment wait interval is passed.
 func (rcs *ReplicaScheduler) RequireNewReplica(replicas map[string]*longhorn.Replica, volume *longhorn.Volume, hardNodeAffinity string) time.Duration {
 	if volume.Status.Robustness != longhorn.VolumeRobustnessDegraded {
 		return 0
@@ -515,6 +526,7 @@ func (rcs *ReplicaScheduler) RequireNewReplica(replicas map[string]*longhorn.Rep
 	}
 	waitInterval := time.Duration(settingValue) * time.Second
 	lastDegradedAt, err := util.ParseTime(volume.Status.LastDegradedAt)
+
 	if err != nil {
 		logrus.Errorf("Failed to get parse volume last degraded timestamp %v, will directly replenish a new replica: %v", volume.Status.LastDegradedAt, err)
 		return 0

@@ -30,7 +30,7 @@ const (
 	// NameMaximumLength restricted the length due to Kubernetes name limitation
 	NameMaximumLength = 40
 
-	MaxRecurringJobRetain = 50
+	MaxRecurringJobRetain = 100
 )
 
 var (
@@ -365,18 +365,13 @@ func (s *DataStore) ValidateSetting(name, value string) (err error) {
 }
 
 func (s *DataStore) AreAllVolumesDetached() (bool, error) {
-	image, err := s.GetSettingValueExisted(types.SettingNameDefaultInstanceManagerImage)
-	if err != nil {
-		return false, err
-	}
-
 	nodes, err := s.ListNodes()
 	if err != nil {
 		return false, err
 	}
 
 	for node := range nodes {
-		engineIMs, err := s.ListInstanceManagersBySelector(node, image, longhorn.InstanceManagerTypeEngine)
+		engineIMs, err := s.ListInstanceManagersBySelector(node, "", longhorn.InstanceManagerTypeEngine)
 		if err != nil {
 			if ErrorIsNotFound(err) {
 				return true, nil
@@ -806,6 +801,32 @@ func (s *DataStore) ListVolumesFollowsGlobalSettingsRO(followedSettingNames map[
 	}
 	selectors, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
 		MatchLabels: followedGlobalSettingsLabels,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := s.ListVolumesBySelectorRO(selectors)
+	if err != nil {
+		return nil, err
+	}
+	for _, itemRO := range list {
+		itemMap[itemRO.Name] = itemRO
+	}
+
+	return itemMap, nil
+}
+
+// ListVolumesByBackupVolumeRO returns an object contains all Volumes with the specified backup-volume label
+func (s *DataStore) ListVolumesByBackupVolumeRO(backupVolumeName string) (map[string]*longhorn.Volume, error) {
+	itemMap := make(map[string]*longhorn.Volume)
+
+	labels := map[string]string{
+		types.LonghornLabelBackupVolume: backupVolumeName,
+	}
+
+	selectors, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+		MatchLabels: labels,
 	})
 	if err != nil {
 		return nil, err
@@ -1257,6 +1278,22 @@ func IsAvailableHealthyReplica(r *longhorn.Replica) bool {
 	return true
 }
 
+// IsReplicaRebuildingFailed returns true if the rebuilding replica failed not caused by network issues.
+func IsReplicaRebuildingFailed(reusableFailedReplica *longhorn.Replica) bool {
+	replicaRebuildFailedCondition := types.GetCondition(reusableFailedReplica.Status.Conditions, longhorn.ReplicaConditionTypeRebuildFailed)
+
+	if replicaRebuildFailedCondition.Status != longhorn.ConditionStatusTrue {
+		return true
+	}
+
+	switch replicaRebuildFailedCondition.Reason {
+	case longhorn.ReplicaConditionReasonRebuildFailedDisconnection, longhorn.NodeConditionReasonManagerPodDown, longhorn.NodeConditionReasonKubernetesNodeGone, longhorn.NodeConditionReasonKubernetesNodeNotReady:
+		return false
+	default:
+		return true
+	}
+}
+
 // GetOwnerReferencesForEngineImage returns OwnerReference for the given
 // Longhorn EngineImage name and UID
 func GetOwnerReferencesForEngineImage(ei *longhorn.EngineImage) []metav1.OwnerReference {
@@ -1417,6 +1454,9 @@ func (s *DataStore) CheckEngineImageReadiness(image string, nodes ...string) (is
 	}
 	undeployedNodes := []string{}
 	for _, node := range nodes {
+		if node == "" {
+			continue
+		}
 		if _, ok := nodesHaveEngineImage[node]; !ok {
 			undeployedNodes = append(undeployedNodes, node)
 		}
@@ -2230,23 +2270,6 @@ func (s *DataStore) ListReadyNodesWithEngineImage(image string) (map[string]*lon
 	return readyNodes, nil
 }
 
-// ListReadyNodesWithReadyEngineImage returns list of ready nodes that have the corresponding engine image deployed
-func (s *DataStore) ListReadyNodesWithReadyEngineImage(image string) (map[string]*longhorn.Node, error) {
-	ei, err := s.GetEngineImage(types.GetEngineImageChecksumName(image))
-	if err != nil {
-		return nil, fmt.Errorf("unable to get engine image %v: %v", image, err)
-	}
-	if ei.Status.State != longhorn.EngineImageStateDeployed {
-		return map[string]*longhorn.Node{}, nil
-	}
-	nodes, err := s.ListNodesWithEngineImage(ei)
-	if err != nil {
-		return nil, err
-	}
-	readyNodes := filterReadyNodes(nodes)
-	return readyNodes, nil
-}
-
 // GetRandomReadyNode gets a list of all Node in the given namespace and
 // returns the first Node marked with condition ready and allow scheduling
 func (s *DataStore) GetRandomReadyNode() (*longhorn.Node, error) {
@@ -2364,6 +2387,25 @@ func (s *DataStore) IsNodeDownOrDeleted(name string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// IsNodeDeleted checks whether the node does not exist by passing in the node name
+func (s *DataStore) IsNodeDeleted(name string) (bool, error) {
+	if name == "" {
+		return false, errors.New("no node name provided to check node down or deleted")
+	}
+
+	node, err := s.GetNodeRO(name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+
+	cond := types.GetCondition(node.Status.Conditions, longhorn.NodeConditionTypeReady)
+
+	return cond.Status == longhorn.ConditionStatusFalse && cond.Reason == longhorn.NodeConditionReasonKubernetesNodeGone, nil
 }
 
 func (s *DataStore) IsNodeSchedulable(name string) bool {
@@ -3702,11 +3744,11 @@ func (s *DataStore) DeleteRecurringJob(name string) error {
 }
 
 func ValidateRecurringJob(job longhorn.RecurringJobSpec) error {
-	if job.Cron == "" || job.Task == "" || job.Name == "" || job.Retain == 0 {
+	if job.Cron == "" || job.Task == "" || job.Name == "" {
 		return fmt.Errorf("invalid job %+v", job)
 	}
-	if job.Task != longhorn.RecurringJobTypeBackup && job.Task != longhorn.RecurringJobTypeSnapshot {
-		return fmt.Errorf("recurring job type %v is not valid", job.Task)
+	if !isValidRecurringJobTask(job.Task) {
+		return fmt.Errorf("recurring job task %v is not valid", job.Task)
 	}
 	if job.Concurrency == 0 {
 		job.Concurrency = types.DefaultRecurringJobConcurrency
@@ -3728,6 +3770,15 @@ func ValidateRecurringJob(job longhorn.RecurringJobSpec) error {
 		}
 	}
 	return nil
+}
+
+func isValidRecurringJobTask(task longhorn.RecurringJobType) bool {
+	return task == longhorn.RecurringJobTypeBackup ||
+		task == longhorn.RecurringJobTypeBackupForceCreate ||
+		task == longhorn.RecurringJobTypeSnapshot ||
+		task == longhorn.RecurringJobTypeSnapshotForceCreate ||
+		task == longhorn.RecurringJobTypeSnapshotCleanup ||
+		task == longhorn.RecurringJobTypeSnapshotDelete
 }
 
 func ValidateRecurringJobs(jobs []longhorn.RecurringJobSpec) error {
